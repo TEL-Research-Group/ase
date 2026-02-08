@@ -1,0 +1,321 @@
+--- # ASE Gitlab CI configuration
+
+default:
+  interruptible: true
+
+variables:
+  OMP_NUM_THREADS: "1"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/pip-cache"
+  PYTEST_ADDOPTS: "--color=yes --durations=20 -r s"
+  COVERAGE_OPTS: "--cov=ase --cov-config=pyproject.toml --junit-xml=report.xml"
+
+stages:
+  - test
+  - paperwork
+  - deploy
+
+workflow:
+  # https://docs.gitlab.com/ci/yaml/#workflowauto_cancelon_new_commit
+  auto_cancel:
+    on_new_commit: interruptible
+
+# This will ensure that only pipelines in master get to update the cache,
+# see https://docs.gitlab.com/ci/caching/
+# conditional-policy:
+#  rules:
+#    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+#      variables:
+#        POLICY: pull-push
+#    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+#      variables:
+#        POLICY: pull
+
+# Check oldest supported Python with oldest supported libraries.
+# Does not install any optional libraries except matplotlib.
+oldlibs:
+  image: registry.gitlab.com/ase/ase:ase-oldlibs
+  before_script:
+    - pwd
+    - whoami
+    - >
+      pip install
+      numpy==1.21.6 scipy==1.8.1 matplotlib==3.5.2
+      pytest==7.4.0 attrs==20.3.0 pluggy==1.0.0 py==1.11.0 six==1.16.0
+      pytest-xdist==3.2.0 execnet==1.8.1 pytest-forked==1.4.0
+    - pip install --no-deps --editable .
+  script:
+    - pytest -n 8 -Wignore::DeprecationWarning
+  cache:
+    key: oldlibs
+    paths:
+     - $PIP_CACHE_DIR
+
+
+# For testing newest versions of libraries against standard images
+# on dockerhub.
+pipinstall:
+  image: python:3.11
+  before_script:
+    - python --version
+    - pip install .[test]
+  script:
+    - ase test
+  when: manual
+
+# This is the main test job using new versions of libraries.
+# The intention is to enable as many features and libraries as possible.
+#
+# We execute it inside the project dir with --editable in order for
+# the coverage script to correctly resolve the OMIT paths (a bit hacky).
+# It would be better to install it for real, and for things to just work.
+main:
+  image: registry.gitlab.com/ase/ase:ase-main
+  before_script:
+    - python --version
+    - pip install --upgrade pytest-cov>=7.0.0 coverage>=7.10.6
+    - pip install --no-deps --editable .
+    - ase info --calculators
+    - cd $CI_PROJECT_DIR
+  script:
+    - >
+      pytest $COVERAGE_OPTS ase/test -n 8
+      --calculators asap,ff,lj,morse,tip3p,tip4p
+  after_script:
+    - coverage xml
+    - mv .coverage coverage-main.dat
+  artifacts:
+    paths:
+      - coverage-main.dat
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      junit: report.xml
+    expire_in: 1 week
+  cache:
+    key: main
+    paths:
+     - $PIP_CACHE_DIR
+
+# Calculator integration tests which always run.
+# Encompasses those tests marked as @pytest.mark.calculator_lite.
+# Please make sure these tests are cheap.
+calculators-lite:
+  image: registry.gitlab.com/ase/ase:ase-full-monty
+  before_script:
+    - pip install --upgrade pytest-cov>=7.0.0 coverage>=7.10.6
+    - pip install --no-deps --editable .
+    - export ASE_CONFIG_PATH=/home/ase/aseconfig.ini
+    - sed 's/binary = /command = /' -i /home/ase/aseconfig.ini
+  script:
+    - >
+      pytest $COVERAGE_OPTS -n 8 -m calculator_lite
+      ase/test/calculator/ --calculators auto
+  after_script:
+    - coverage xml
+    - mv .coverage coverage-calculators-lite.dat
+  artifacts:
+    paths:
+      - coverage-calculators-lite.dat
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      junit: report.xml
+    expire_in: 1 week
+  cache:
+    key: calculators
+    paths:
+     - $PIP_CACHE_DIR
+
+# Plan: Test as many calculators as possible as well as possible.
+# Obviously this is kind of expensive so the job is manually activated.
+# Also, the docker serves as a knowledgebase for how to set up those
+# calculators with ASE.
+#
+# It would be great if someone could enable more calculators with this.
+calculators:
+  image: registry.gitlab.com/ase/ase:ase-full-monty
+  before_script:
+    - pip install --no-deps --editable .
+    - pip install --upgrade pytest-cov>=7.0.0 coverage>=7.10.6
+    - export ASE_CONFIG_PATH=/home/ase/aseconfig.ini
+    - sed 's/binary = /command = /' -i /home/ase/aseconfig.ini
+    - ase info --calculators
+  script:
+    - >
+      pytest $COVERAGE_OPTS -n 8 ase/test/calculator
+      --calculators abinit,asap,cp2k,dftb,espresso,gpaw,kim,lammpslib,lammpsrun,mopac,nwchem,octopus,siesta
+  after_script:
+    - coverage xml
+    - mv .coverage coverage-calculators.dat
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+      when: manual
+      allow_failure: true
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  artifacts:
+    paths:
+      - coverage-calculators.dat
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      junit: report.xml
+    expire_in: 1 week
+  cache:
+    key: calculators
+    policy: pull
+    paths:
+     - $PIP_CACHE_DIR
+
+bleeding-edge:
+  image: python:3-alpine
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/pip-cache"
+  before_script:
+    - pip install --upgrade numpy scipy matplotlib
+    - pip install --editable .[test]
+    - pip freeze
+  script:
+    - ase test --pytest --ignore gui/ --ignore test_imports.py
+  cache:
+    paths:
+      - $PIP_CACHE_DIR
+    key: bleeding-edge
+
+
+doc:
+  image: registry.gitlab.com/ase/ase:ase-full-monty
+  before_script:
+    - pip install scriv sphinx_book_theme sphinx-gallery
+    - pip install --no-deps .[docs]
+    - ase info
+    - which sphinx-build
+  script:
+    - scriv collect --keep || echo Not compiling changelog then  # Avoid error
+    - python -m ase.utils.sphinx run # test scripts
+    - sphinx-build -W doc doc/build
+    - mv doc/build web-html
+  cache:
+    paths:
+      - $PIP_CACHE_DIR
+    key: doc
+  artifacts:
+    paths:
+      - web-html
+    expire_in: 1 week
+
+distribution-package:
+  image: registry.gitlab.com/ase/ase:ase-main
+  before_script:
+    - mkdir dist
+    - pip install setuptools build
+  script:
+    - python -m build
+    - ls dist/*
+    - pip install dist/ase-*.tar.gz
+    - ase test
+    - pip uninstall --yes ase
+    - pip install dist/ase-*-py3-none-any.whl
+    - ase test
+  artifacts:
+    paths:
+      - dist
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "push"
+      when: manual
+      allow_failure: true
+
+# Publish code coverage data on web.
+#  * The deploy stage is specially recognized by gitlab
+#  * The jobname pages is specially recognized by gitlab
+#  * The public/ directory is specially recognized by gitlab
+# https://about.gitlab.com/blog/2016/11/03/publish-code-coverage-report-with-gitlab-pages/
+pages:
+  stage: deploy
+  dependencies:
+    - coverage-combine
+    - doc
+  script:
+    - mkdir public
+    - mv coverage-html public/
+    - pwd
+    - ls
+    - mv web-html/* public/
+  artifacts:
+    paths:
+      - public
+    expire_in: 2 weeks
+  only:
+    - master
+
+lint:
+  image: python:3.12.4-alpine
+  before_script:
+    - pip install .[lint]
+    - pip freeze
+  script:
+    - mypy --version
+    - mypy --color-output -p ase
+    - python -We:invalid -m compileall -f -q ase/
+    - ruff check
+    - ruff format --check
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/pip-cache"
+  cache:
+    paths:
+      - $PIP_CACHE_DIR
+    key: lint
+
+coverage-combine:
+  image: registry.gitlab.com/ase/ase:ase-paperwork
+  stage: paperwork
+  dependencies:
+    - main
+    - calculators-lite
+  before_script:
+    - pip install --upgrade coverage
+  script:
+    - coverage combine coverage-main.dat coverage-calculators-lite.dat
+    - coverage report
+    - coverage html
+  coverage: '/TOTAL.+ ([0-9]+\.[0-9]+%)/'
+  artifacts:
+    paths:
+      - coverage-html
+    expire_in: 1 week
+  cache:
+    paths:
+      - $PIP_CACHE_DIR
+    key: coverage-combine
+
+windows_test:
+  tags:
+    - saas-windows-medium-amd64
+  stage: test
+  before_script:
+    # https://stackoverflow.com/questions/61791108/gitlab-ci-shared-windows-runner-for-python
+    # https://gitlab.com/gitlab-org/ci-cd/shared-runners/images/gcp/windows-containers/-/issues/13
+    - Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+    - choco install python --version=3.10 -y -f
+    - refreshenv
+    - python --version
+    - python -m pip install --upgrade pip
+    - python -m pip install pytest
+    - python -m pip install --editable .
+  script:
+    - >
+      ase test
+      --calculators eam,ff,lj,morse,tip3p,tip4p
+      --pytest
+      -W "ignore:The --rsyncdir command line argument"
+      -W "ignore:NumPy will stop allowing conversion of out-of-bound Python integers"
+  when: manual
+  # rules:
+  #  - if: $CI_PIPELINE_SOURCE == "push"
+  #    when: manual
+  #    allow_failure: true
+  #  - if: $CI_PIPELINE_SOURCE == "schedule"
